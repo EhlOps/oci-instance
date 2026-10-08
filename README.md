@@ -16,6 +16,64 @@ docker run --rm hello-world
 nproc && free -g
 ```
 
+## Disk
+The OL10 image only lays out ~47 GB of the boot volume. `cloud-init.yaml` runs `/usr/libexec/oci-growfs -y` on first boot (non-fatal) to grow root into the rest. Check with `df -h /` and `grep growfs /var/log/cloud-init-output.log`. On an existing instance, run `sudo /usr/libexec/oci-growfs -y`.
+
+## Oracle Linux 10 primer
+Oracle Linux is a RHEL-compatible distro (same family as Rocky, Alma and CentOS Stream), so RHEL docs and answers generally apply. If you know Ubuntu or Debian, the main differences are below.
+
+**Users and access**
+- The default user is `opc` (not `ubuntu`), with passwordless `sudo`. Login is by the SSH key set in `ssh_public_key_path`.
+- Log in as `opc` and use `sudo` rather than logging in as `root`.
+
+**Packages**
+| Task | Command |
+|---|---|
+| Install / remove | `sudo dnf install <pkg>` / `sudo dnf remove <pkg>` |
+| Update everything | `sudo dnf upgrade` |
+| Search / info | `dnf search <term>` / `dnf info <pkg>` |
+| Which package owns a file | `dnf provides /path/to/file` |
+| List installed | `rpm -qa` or `dnf list installed` |
+| Repo config | `/etc/yum.repos.d/*.repo` (`dnf repolist`) |
+
+- `dnf` is the package manager (`yum` is an alias for it). Packages are `.rpm` files, not `.deb`, and there is no `apt`.
+- Software comes from Oracle's `ol10_*` repos. Third-party repos, like Docker's, are `.repo` files in `/etc/yum.repos.d/`.
+- Some Oracle repos (e.g. `ol10_ksplice`) can be unreachable, which is why the bootstrap lets other repos be skipped. Toggle a repo for one command with `--enablerepo=<id>` / `--disablerepo=<id>`.
+- `dnf-automatic` can apply security updates unattended. It is not enabled here.
+
+**Services (systemd)**
+- `sudo systemctl status|start|stop|restart|enable|disable <unit>`. `enable --now` does enable plus start.
+- Logs go to the journal: `journalctl -u <unit> -f`, `journalctl -b` (this boot), `journalctl -p err`.
+
+**Directory layout**
+| Path | What it is |
+|---|---|
+| `/etc` | System config (`/etc/yum.repos.d`, `/etc/ssh/sshd_config`, `/etc/docker`) |
+| `/var/log` | Logs (`/var/log/cloud-init-output.log`, `/var/log/messages`) |
+| `/var/lib` | Service state (`/var/lib/docker`, `/var/lib/cloud`) |
+| `/usr/bin`, `/usr/sbin` | Installed programs. `/bin` and `/sbin` are symlinks to these |
+| `/usr/local/sbin`, `/usr/local/bin` | Things you add by hand (the Docker bootstrap script lives here) |
+| `/opt` | Self-contained third-party software |
+| `/home/opc` | Your home directory |
+| `/boot`, `/boot/efi` | Kernel and bootloader (UEFI) |
+| `/var/oled` | Oracle Linux Enhanced Diagnostics data, on its own 20 GB volume |
+| `/tmp`, `/run` | Scratch space. `/run` is RAM-backed and cleared on reboot |
+
+**Storage**
+- Disks use LVM. Volume group `ocivolume` holds the logical volumes `root` (`/`) and `oled` (`/var/oled`), both formatted XFS. See `lsblk`, `sudo vgs`, `sudo lvs`.
+- Grow a filesystem with `oci-growfs`, not `resize2fs` (XFS can only grow, never shrink).
+
+**Network and firewall**
+- The host firewall is `firewalld`, on top of the OCI security list. Opening a port needs both. Example: `sudo firewall-cmd --permanent --add-port=8080/tcp && sudo firewall-cmd --reload`.
+- Check what is open with `sudo firewall-cmd --list-all`, and what is listening with `sudo ss -tlnp`.
+
+**Security**
+- SELinux is enforcing by default. If a service works as root but is denied otherwise, check `sudo ausearch -m avc -ts recent` before turning SELinux off. Bind mounts into containers usually need the `:z` suffix, like `-v /data:/data:z`.
+- The kernel is Oracle's UEK (`uname -r`). Reboot after kernel updates (`sudo dnf needs-restarting -r` tells you if you need to).
+
+**Architecture**
+- This is an arm64 (`aarch64`) machine. Docker images must have an arm64 variant (most official ones do), and prebuilt x86-only binaries will not run.
+
 ## Docker bootstrap and troubleshooting
 Docker is installed by `/usr/local/sbin/docker-bootstrap.sh` (written by `cloud-init.yaml`). It waits for the network, retries, verifies the Docker repo has `gpgcheck=1` and that the GPG key fingerprint is `060A 61C5 1B55 8A7F 742B 77AA C52F EB6B 621E 9F35`, installs Docker, enables it at boot, and writes `/var/lib/cloud/docker-bootstrap.done` only after `docker --version` and `systemctl is-enabled docker` both pass. On failure it exits non-zero and logs `docker-bootstrap: FAILED: ...` to `/var/log/cloud-init-output.log`. Note `cloud-init status` can still say `done` with no errors, so check the marker file:
 ```

@@ -42,25 +42,32 @@ write_files:
 
       # 2. Write the repo file and check gpgcheck and key fingerprint BEFORE installing.
       retry 5 curl -fsS --max-time 30 -o "$REPO_FILE" "$REPO_URL" || die "cannot fetch $REPO_URL"
-      grep -q '^gpgcheck=1' "$REPO_FILE" || die "gpgcheck=1 not set in $REPO_FILE"
-      grep -q '^gpgkey=' "$REPO_FILE" || die "no gpgkey in $REPO_FILE"
+      # Only the [docker-ce-stable] section matters: it is the one we install from.
+      stable=$(awk '/^\[/{s=($0=="[docker-ce-stable]")} s' "$REPO_FILE")
+      grep -q '^gpgcheck=1' <<<"$stable" || die "gpgcheck=1 not set in [docker-ce-stable] of $REPO_FILE"
+      grep -q '^gpgkey=' <<<"$stable" || die "no gpgkey in [docker-ce-stable] of $REPO_FILE"
       keyfile=$(mktemp)
+      trap 'rm -f "$keyfile"' EXIT
       retry 5 curl -fsS --max-time 30 -o "$keyfile" "$GPG_URL" || die "cannot fetch Docker GPG key"
-      gpg --show-keys --with-colons "$keyfile" | awk -F: '$1=="fpr"{print $10}' | grep -qx "$DOCKER_FPR" \
+      # Capture first: grep -q exiting early would SIGPIPE awk and trip pipefail.
+      fprs=$(gpg --show-keys --with-colons "$keyfile" | awk -F: '$1=="fpr"{print $10}')
+      grep -qx "$DOCKER_FPR" <<<"$fprs" \
         || die "Docker GPG key fingerprint mismatch (expected $DOCKER_FPR)"
-      rm -f "$keyfile"
+      # Trust exactly the verified key, not whatever the repo file's gpgkey= URL serves.
+      rpm --import "$keyfile" || die "cannot import verified Docker GPG key"
       log "repo gpgcheck=1 and key fingerprint verified"
 
       # 3. Install. Other repos (e.g. ol10_ksplice) may be unreachable and must not abort dnf;
       #    the Docker repo must NOT be skippable.
       for pkg in podman buildah runc; do
-        if rpm -q "$pkg" >/dev/null 2>&1; then dnf -y remove "$pkg"; fi
+        if rpm -q "$pkg" >/dev/null 2>&1; then dnf -y remove "$pkg" || die "cannot remove $pkg"; fi
       done
       retry 5 dnf -y \
         --setopt=skip_if_unavailable=True \
         --setopt=docker-ce-stable.skip_if_unavailable=False \
         --setopt=retries=10 \
         install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        git vim-enhanced \
         || die "dnf install failed"
 
       # 4. Enable at boot and start.
@@ -75,6 +82,9 @@ write_files:
       log "OK"
 
 runcmd:
-  - /usr/local/sbin/docker-bootstrap.sh
+  # Grow the root LV into the rest of the boot volume (the image layout is ~47 GB).
+  - [sh, -c, '/usr/libexec/oci-growfs -y || echo "growfs: FAILED (non-fatal), run /usr/libexec/oci-growfs -y by hand"']
   - firewall-cmd --permanent --add-service=http --add-service=https
   - firewall-cmd --reload
+  # Last, so its exit code is runcmd's exit code and cloud-init status reports a failure.
+  - /usr/local/sbin/docker-bootstrap.sh
