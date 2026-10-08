@@ -1,11 +1,80 @@
 #cloud-config
 # Oracle Linux 10 is RHEL 10 compatible, so use Docker's RHEL repo.
+# All Docker work lives in one script that fails loudly (non-zero exit, log lines in
+# /var/log/cloud-init-output.log) and writes /var/lib/cloud/docker-bootstrap.done only
+# after `docker --version` and `systemctl is-enabled docker` both pass.
+write_files:
+  - path: /usr/local/sbin/docker-bootstrap.sh
+    permissions: "0700"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Overridable for tests only.
+      REPO_URL="${REPO_URL:-https://download.docker.com/linux/rhel/docker-ce.repo}"
+      GPG_URL="${GPG_URL:-https://download.docker.com/linux/rhel/gpg}"
+      REPO_FILE="${REPO_FILE:-/etc/yum.repos.d/docker-ce.repo}"
+      MARKER="${MARKER:-/var/lib/cloud/docker-bootstrap.done}"
+      WAIT_SECS="${WAIT_SECS:-300}"
+      DOCKER_FPR="060A61C51B558A7F742B77AAC52FEB6B621E9F35"
+      log() { echo "docker-bootstrap: $*"; }
+      die() { log "FAILED: $*"; exit 1; }
+
+      retry() { # retry <attempts> <cmd...>
+        local n=$1 i; shift
+        for ((i = 1; i <= n; i++)); do
+          "$@" && return 0
+          log "attempt $i/$n failed: $*"; sleep 10
+        done
+        return 1
+      }
+
+      rm -f "$MARKER"
+
+      # 1. Wait for outbound connectivity (runcmd can run before the network is usable).
+      log "waiting for $REPO_URL"
+      end=$((SECONDS + WAIT_SECS))
+      until curl -fsSI --max-time 10 "$REPO_URL" >/dev/null; do
+        [ "$SECONDS" -lt "$end" ] || die "no connectivity to Docker repo after ${WAIT_SECS}s"
+        sleep 5
+      done
+
+      # 2. Write the repo file and check gpgcheck and key fingerprint BEFORE installing.
+      retry 5 curl -fsS --max-time 30 -o "$REPO_FILE" "$REPO_URL" || die "cannot fetch $REPO_URL"
+      grep -q '^gpgcheck=1' "$REPO_FILE" || die "gpgcheck=1 not set in $REPO_FILE"
+      grep -q '^gpgkey=' "$REPO_FILE" || die "no gpgkey in $REPO_FILE"
+      keyfile=$(mktemp)
+      retry 5 curl -fsS --max-time 30 -o "$keyfile" "$GPG_URL" || die "cannot fetch Docker GPG key"
+      gpg --show-keys --with-colons "$keyfile" | awk -F: '$1=="fpr"{print $10}' | grep -qx "$DOCKER_FPR" \
+        || die "Docker GPG key fingerprint mismatch (expected $DOCKER_FPR)"
+      rm -f "$keyfile"
+      log "repo gpgcheck=1 and key fingerprint verified"
+
+      # 3. Install. Other repos (e.g. ol10_ksplice) may be unreachable and must not abort dnf;
+      #    the Docker repo must NOT be skippable.
+      for pkg in podman buildah runc; do
+        if rpm -q "$pkg" >/dev/null 2>&1; then dnf -y remove "$pkg"; fi
+      done
+      retry 5 dnf -y \
+        --setopt=skip_if_unavailable=True \
+        --setopt=docker-ce-stable.skip_if_unavailable=False \
+        --setopt=retries=10 \
+        install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        || die "dnf install failed"
+
+      # 4. Enable at boot and start.
+      systemctl enable --now docker || die "cannot enable docker"
+      # NOTE: same as the previous cloud-init. docker group is root-equivalent; see README.
+      usermod -aG docker opc || die "usermod failed"
+
+      # 5. Verify, then write the marker.
+      docker --version || die "docker --version failed"
+      systemctl is-enabled docker || die "docker is not enabled"
+      touch "$MARKER"
+      log "OK"
+
 runcmd:
-  - dnf -y install dnf-plugins-core
-  - dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
-  - dnf -y remove podman buildah runc || true
-  - dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  - systemctl enable --now docker
-  - usermod -aG docker opc
+  - /usr/local/sbin/docker-bootstrap.sh
   - firewall-cmd --permanent --add-service=http --add-service=https
   - firewall-cmd --reload
