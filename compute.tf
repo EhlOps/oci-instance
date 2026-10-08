@@ -40,6 +40,8 @@ resource "oci_core_instance" "main" {
 
   lifecycle {
     # A newer image being published should not force a rebuild
-    ignore_changes = [source_details[0].source_id]
+    # OPTIONAL: changing cloud-init.yaml must not replace the live instance (user_data only
+    # runs on first boot anyway). Fresh creates still get the new user_data.
+    ignore_changes = [source_details[0].source_id, metadata["user_data"]]
   }
 }
